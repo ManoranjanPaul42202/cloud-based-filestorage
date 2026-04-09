@@ -1,7 +1,13 @@
 const db = require("../config/db");
 const fs = require("fs");
+const { contentTypeForFileName, resolveUploadContentType } = require("../utils/contentType");
 
-const { S3Client, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  GetObjectCommand,
+  DeleteObjectCommand,
+  PutObjectCommand
+} = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 // 🔥 S3 CLIENT
@@ -26,13 +32,15 @@ exports.uploadFile = (req, res) => {
 
   const key = Date.now() + "_" + file.originalname;
 
+  const contentType = resolveUploadContentType(file.originalname, file.mimetype);
   const params = {
     Bucket: BUCKET_NAME,
     Key: key,
-    Body: fileStream
+    Body: fileStream,
+    ContentType: contentType
   };
 
-  s3Client.send(new (require("@aws-sdk/client-s3").PutObjectCommand)(params))
+  s3Client.send(new PutObjectCommand(params))
     .then(() => {
 
       const query = `
@@ -91,22 +99,28 @@ exports.getDownloadUrl = async (req, res) => {
     }
 
     db.query(
-      "SELECT s3_key FROM files WHERE id = ? AND user_id = ?",
+      "SELECT s3_key, file_name FROM files WHERE id = ? AND user_id = ?",
       [fileId, req.user.id],
       async (dbErr, result) => {
         if (dbErr) return res.status(500).json({ message: "DB error" });
         if (result.length === 0) return res.status(404).json({ message: "File not found" });
 
+        const row = result[0];
+        const fileName = row.file_name || "download";
+        const ct = contentTypeForFileName(fileName);
         const command = new GetObjectCommand({
           Bucket: BUCKET_NAME,
-          Key: result[0].s3_key
+          Key: row.s3_key,
+          ResponseContentType: ct,
+          ResponseContentDisposition: `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`
         });
 
+        const expiresInSeconds = 300;
         const url = await getSignedUrl(s3Client, command, {
-          expiresIn: 60
+          expiresIn: expiresInSeconds
         });
 
-        res.json({ url });
+        res.json({ url, expiresInSeconds });
       }
     );
 
