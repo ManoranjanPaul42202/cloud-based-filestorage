@@ -1,7 +1,7 @@
 const db = require("../config/db");
 const fs = require("fs");
+const AWS = require("aws-sdk");
 const { contentTypeForFileName, resolveUploadContentType } = require("../utils/contentType");
-
 const {
   S3Client,
   GetObjectCommand,
@@ -10,7 +10,6 @@ const {
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
-// 🔥 S3 CLIENT
 const s3Client = new S3Client({
   region: process.env.AWS_REGION,
   credentials: {
@@ -20,17 +19,76 @@ const s3Client = new S3Client({
 });
 
 const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
+const CLOUDFRONT_URL = (process.env.CLOUDFRONT_URL || "").replace(/\/+$/, "");
+const CLOUDFRONT_KEY_PAIR_ID = process.env.CLOUDFRONT_KEY_PAIR_ID;
+const CLOUDFRONT_PRIVATE_KEY = process.env.CLOUDFRONT_PRIVATE_KEY;
 
-/* ===================== UPLOAD FILE ===================== */
-exports.uploadFile = (req, res) => {
+const VALID_VISIBILITIES = ["private", "shared", "public"];
+const VALID_PERMISSIONS = ["view", "download"];
+
+const dbQuery = (sql, params = []) =>
+  new Promise((resolve, reject) => {
+    db.query(sql, params, (err, result) => {
+      if (err) return reject(err);
+      resolve(result);
+    });
+  });
+
+const normalizeKey = (key) =>
+  key
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+
+const getCloudFrontUrl = (key) => `${CLOUDFRONT_URL}/${normalizeKey(key)}`;
+
+const getCloudFrontSignedUrl = (url, expiresInSeconds) => {
+  if (!CLOUDFRONT_KEY_PAIR_ID || !CLOUDFRONT_PRIVATE_KEY) {
+    throw new Error("CloudFront signing configuration missing");
+  }
+
+  const signer = new AWS.CloudFront.Signer(CLOUDFRONT_KEY_PAIR_ID, CLOUDFRONT_PRIVATE_KEY);
+  return signer.getSignedUrl({
+    url,
+    expires: Math.floor(Date.now() / 1000) + expiresInSeconds
+  });
+};
+
+const getS3SignedUrl = async (key, expiresInSeconds) => {
+  const command = new GetObjectCommand({
+    Bucket: BUCKET_NAME,
+    Key: key
+  });
+  return getSignedUrl(s3Client, command, { expiresIn: expiresInSeconds });
+};
+
+const canAccessFile = async (userId, file) => {
+  if (!file) return false;
+  if (file.user_id === userId) return true;
+  if (file.visibility === "public") return true;
+  if (file.visibility === "shared") {
+    const rows = await dbQuery(
+      "SELECT 1 FROM file_shares WHERE file_id = ? AND shared_with_user_id = ? LIMIT 1",
+      [file.id, userId]
+    );
+    return rows.length > 0;
+  }
+  return false;
+};
+
+exports.uploadFile = async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: "No file uploaded" });
   }
 
+  const visibility = (req.body.visibility || "private").toLowerCase();
+  if (!VALID_VISIBILITIES.includes(visibility)) {
+    return res.status(400).json({ message: `visibility must be one of ${VALID_VISIBILITIES.join(", ")}` });
+  }
+
   const file = req.file;
   const fileStream = fs.createReadStream(file.path);
-
-  const key = Date.now() + "_" + file.originalname;
+  const key = `${Date.now()}_${file.originalname}`;
 
   const contentType = resolveUploadContentType(file.originalname, file.mimetype);
   const params = {
@@ -40,171 +98,232 @@ exports.uploadFile = (req, res) => {
     ContentType: contentType
   };
 
-  s3Client.send(new PutObjectCommand(params))
-    .then(() => {
+  try {
+    await s3Client.send(new PutObjectCommand(params));
 
-      const query = `
-        INSERT INTO files (user_id, file_name, s3_key, file_size)
-        VALUES (?, ?, ?, ?)
-      `;
+    const query = `
+      INSERT INTO files (file_name, s3_key, file_size, user_id, visibility, upload_date)
+      VALUES (?, ?, ?, ?, ?, NOW())
+    `;
 
-      db.query(query, [
-        req.user.id,
-        file.originalname,
-        key,
-        file.size
-      ], (err) => {
-        if (err) {
-          console.error(err);
-          return res.status(500).json({ message: "DB insert failed" });
-        }
+    await dbQuery(query, [file.originalname, key, file.size, req.user.id, visibility]);
+    fs.unlink(file.path, () => {});
 
-        // Delete temp file
-        fs.unlink(file.path, () => {});
-
-        res.json({
-          message: "File uploaded successfully",
-          key: key
-        });
-      });
-
-    })
-    .catch(err => {
-      console.error(err);
-      res.status(500).json({ message: "Upload failed" });
+    res.json({
+      message: "File uploaded successfully",
+      key,
+      visibility
     });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Upload failed" });
+  }
 };
 
-
-/* ===================== GET FILES ===================== */
-exports.getFiles = (req, res) => {
-  db.query("SELECT * FROM files WHERE user_id = ?", [req.user.id], (err, results) => {
-    if (err) {
-      console.error(err);
-      return res.status(500).json({ message: "DB error" });
-    }
-
-    res.json(results);
-  });
+exports.getFiles = async (req, res) => {
+  try {
+    const rows = await dbQuery(
+      `SELECT f.*, COUNT(fs.id) AS shared_count
+       FROM files f
+       LEFT JOIN file_shares fs ON fs.file_id = f.id
+       WHERE f.user_id = ?
+       GROUP BY f.id
+       ORDER BY f.upload_date DESC`,
+      [req.user.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "DB error" });
+  }
 };
 
+exports.getSharedFiles = async (req, res) => {
+  try {
+    const rows = await dbQuery(
+      `SELECT f.id, f.file_name, f.s3_key, f.file_size, f.user_id, f.visibility, f.upload_date, fs.permission,
+              u.email AS owner_email
+       FROM file_shares fs
+       JOIN files f ON f.id = fs.file_id
+       JOIN users u ON u.id = f.user_id
+       WHERE fs.shared_with_user_id = ?
+         AND f.visibility = 'shared'
+       ORDER BY f.upload_date DESC`,
+      [req.user.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "DB error" });
+  }
+};
 
-/* ===================== GET DOWNLOAD URL ===================== */
+exports.getFileById = async (req, res) => {
+  const file = req.fileRecord;
+  if (!file) {
+    return res.status(404).json({ message: "File not found" });
+  }
+  res.json(file);
+};
+
 exports.getDownloadUrl = async (req, res) => {
   try {
     const fileId = req.query.fileId;
-
     if (!fileId) {
       return res.status(400).json({ message: "fileId required" });
     }
 
-    db.query(
-      "SELECT s3_key, file_name FROM files WHERE id = ? AND user_id = ?",
-      [fileId, req.user.id],
-      async (dbErr, result) => {
-        if (dbErr) return res.status(500).json({ message: "DB error" });
-        if (result.length === 0) return res.status(404).json({ message: "File not found" });
+    const rows = await dbQuery("SELECT * FROM files WHERE id = ?", [fileId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "File not found" });
+    }
+    const file = rows[0];
+    const allowed = await canAccessFile(req.user.id, file);
+    if (!allowed) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
 
-        const row = result[0];
-        const fileName = row.file_name || "download";
-        const ct = contentTypeForFileName(fileName);
-        const command = new GetObjectCommand({
-          Bucket: BUCKET_NAME,
-          Key: row.s3_key,
-          ResponseContentType: ct,
-          ResponseContentDisposition: `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`
-        });
+    const expiresInSeconds = 300;
+    const encodedKey = normalizeKey(file.s3_key);
+    const directUrl = CLOUDFRONT_URL ? getCloudFrontUrl(file.s3_key) : `https://${BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${encodedKey}`;
 
-        const expiresInSeconds = 300;
-        const url = await getSignedUrl(s3Client, command, {
-          expiresIn: expiresInSeconds
-        });
+    if (file.visibility === "public") {
+      return res.json({ url: directUrl, expiresInSeconds });
+    }
 
-        res.json({ url, expiresInSeconds });
-      }
-    );
+    if (CLOUDFRONT_URL && CLOUDFRONT_KEY_PAIR_ID && CLOUDFRONT_PRIVATE_KEY) {
+      const signedUrl = getCloudFrontSignedUrl(directUrl, expiresInSeconds);
+      return res.json({ url: signedUrl, expiresInSeconds });
+    }
 
+    const signedS3Url = await getS3SignedUrl(file.s3_key, expiresInSeconds);
+    res.json({ url: signedS3Url, expiresInSeconds });
   } catch (err) {
     console.error("Download Error:", err);
     res.status(500).json({ message: err.message });
   }
 };
 
+exports.shareFile = async (req, res) => {
+  const file = req.fileRecord;
+  if (!file) {
+    return res.status(404).json({ message: "File not found" });
+  }
 
-/* ===================== DELETE FILE ===================== */
-exports.deleteFile = async (req, res) => {
+  const { shared_with_user_id, permission = "view" } = req.body;
+  if (!shared_with_user_id) {
+    return res.status(400).json({ message: "shared_with_user_id is required" });
+  }
+  if (!VALID_PERMISSIONS.includes(permission)) {
+    return res.status(400).json({ message: `permission must be one of ${VALID_PERMISSIONS.join(", ")}` });
+  }
+  if (shared_with_user_id === req.user.id) {
+    return res.status(400).json({ message: "Owner cannot be added as a shared user" });
+  }
+
   try {
-    const { id } = req.params;
+    const users = await dbQuery("SELECT id FROM users WHERE id = ?", [shared_with_user_id]);
+    if (users.length === 0) {
+      return res.status(404).json({ message: "Target user not found" });
+    }
 
-    // Step 1: Get file key from DB
-    db.query(
-      "SELECT s3_key FROM files WHERE id = ? AND user_id = ?",
-      [id, req.user.id],
-      async (err, results) => {
-      if (err) {
-        return res.status(500).json({ message: "DB error" });
-      }
+    await dbQuery(
+      `INSERT INTO file_shares (file_id, shared_with_user_id, permission, created_at)
+       VALUES (?, ?, ?, NOW())
+       ON DUPLICATE KEY UPDATE permission = VALUES(permission)`,
+      [file.id, shared_with_user_id, permission]
+    );
 
-      if (results.length === 0) {
-        return res.status(404).json({ message: "File not found" });
-      }
+    if (file.visibility === "private") {
+      await dbQuery("UPDATE files SET visibility = 'shared' WHERE id = ?", [file.id]);
+    }
 
-      const fileKey = results[0].s3_key;
-
-      // Step 2: Delete from S3
-      const deleteCommand = new DeleteObjectCommand({
-        Bucket: BUCKET_NAME,
-        Key: fileKey
-      });
-
-      await s3Client.send(deleteCommand);
-
-      // Step 3: Delete from DB
-      db.query("DELETE FROM files WHERE id = ? AND user_id = ?", [id, req.user.id], (err2) => {
-        if (err2) {
-          return res.status(500).json({ message: "DB delete failed" });
-        }
-
-        res.json({ message: "File deleted successfully" });
-      });
-    });
-
+    res.json({ message: "File shared successfully", fileId: file.id, shared_with_user_id, permission });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: err.message });
+    res.status(500).json({ message: "Could not share file" });
   }
 };
 
-exports.getFileById = (req, res) => {
-  const { id } = req.params;
-  db.query(
-    "SELECT * FROM files WHERE id = ? AND user_id = ?",
-    [id, req.user.id],
-    (err, result) => {
-      if (err) return res.status(500).json({ message: "DB error" });
-      if (result.length === 0) return res.status(404).json({ message: "File not found" });
-      res.json(result[0]);
-    }
-  );
+exports.changeVisibility = async (req, res) => {
+  const file = req.fileRecord;
+  if (!file) {
+    return res.status(404).json({ message: "File not found" });
+  }
+
+  const visibility = (req.body.visibility || "").toLowerCase();
+  if (!VALID_VISIBILITIES.includes(visibility)) {
+    return res.status(400).json({ message: `visibility must be one of ${VALID_VISIBILITIES.join(", ")}` });
+  }
+
+  try {
+    await dbQuery("UPDATE files SET visibility = ? WHERE id = ?", [visibility, file.id]);
+    res.json({ message: "Visibility updated", fileId: file.id, visibility });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not update visibility" });
+  }
 };
 
-exports.renameFile = (req, res) => {
-  const { id } = req.params;
-  const { file_name } = req.body;
+exports.revokeShare = async (req, res) => {
+  const file = req.fileRecord;
+  if (!file) {
+    return res.status(404).json({ message: "File not found" });
+  }
 
-  if (!file_name || !file_name.trim()) {
+  const userId = req.body.shared_with_user_id || req.query.shared_with_user_id;
+  if (!userId) {
+    return res.status(400).json({ message: "shared_with_user_id is required" });
+  }
+
+  try {
+    const result = await dbQuery(
+      "DELETE FROM file_shares WHERE file_id = ? AND shared_with_user_id = ?",
+      [file.id, userId]
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Share entry not found" });
+    }
+    res.json({ message: "Share revoked", fileId: file.id, shared_with_user_id: userId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not revoke share" });
+  }
+};
+
+exports.deleteFile = async (req, res) => {
+  const file = req.fileRecord;
+  if (!file) {
+    return res.status(404).json({ message: "File not found" });
+  }
+
+  try {
+    await s3Client.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: file.s3_key }));
+    await dbQuery("DELETE FROM files WHERE id = ?", [file.id]);
+    await dbQuery("DELETE FROM file_shares WHERE file_id = ?", [file.id]);
+    res.json({ message: "File deleted successfully", fileId: file.id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not delete file" });
+  }
+};
+
+exports.renameFile = async (req, res) => {
+  const file = req.fileRecord;
+  if (!file) {
+    return res.status(404).json({ message: "File not found" });
+  }
+
+  const fileName = (req.body.file_name || "").trim();
+  if (!fileName) {
     return res.status(400).json({ message: "file_name is required" });
   }
 
-  db.query(
-    "UPDATE files SET file_name = ? WHERE id = ? AND user_id = ?",
-    [file_name.trim(), id, req.user.id],
-    (err, result) => {
-      if (err) return res.status(500).json({ message: "DB error" });
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ message: "File not found" });
-      }
-      res.json({ message: "File renamed successfully" });
-    }
-  );
+  try {
+    await dbQuery("UPDATE files SET file_name = ? WHERE id = ?", [fileName, file.id]);
+    res.json({ message: "File renamed successfully", fileId: file.id, file_name: fileName });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not rename file" });
+  }
 };
