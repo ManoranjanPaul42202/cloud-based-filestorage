@@ -224,6 +224,9 @@ exports.shareFile = async (req, res) => {
 
   if (!Number.isInteger(targetUserId) && email) {
     targetUserId = await resolveUserIdByEmail(email);
+    if (!targetUserId) {
+      return res.status(404).json({ message: "Target user not found for provided email." });
+    }
   }
 
   if (!Number.isInteger(targetUserId)) {
@@ -294,6 +297,9 @@ exports.revokeShare = async (req, res) => {
 
   if (!Number.isInteger(targetUserId) && email) {
     targetUserId = await resolveUserIdByEmail(email);
+    if (!targetUserId) {
+      return res.status(404).json({ message: "Target user not found for provided email." });
+    }
   }
 
   if (!Number.isInteger(targetUserId)) {
