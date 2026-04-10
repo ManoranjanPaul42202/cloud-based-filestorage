@@ -191,19 +191,20 @@ exports.getDownloadUrl = async (req, res) => {
 
     const expiresInSeconds = 300;
     const encodedKey = normalizeKey(file.s3_key);
-    const directUrl = CLOUDFRONT_URL ? getCloudFrontUrl(file.s3_key) : `https://${BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${encodedKey}`;
-
-    if (file.visibility === "public") {
-      return res.json({ url: directUrl, expiresInSeconds });
-    }
+    const s3PublicUrl = `https://${BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${encodedKey}`;
 
     if (CLOUDFRONT_URL && CLOUDFRONT_KEY_PAIR_ID && CLOUDFRONT_PRIVATE_KEY) {
       try {
-        const signedUrl = getCloudFrontSignedUrl(directUrl, expiresInSeconds);
+        const cloudFrontUrl = getCloudFrontUrl(file.s3_key);
+        const signedUrl = getCloudFrontSignedUrl(cloudFrontUrl, expiresInSeconds);
         return res.json({ url: signedUrl, expiresInSeconds });
       } catch (cloudfrontError) {
         console.warn("CloudFront signing failed, falling back to S3:", cloudfrontError.message);
       }
+    }
+
+    if (file.visibility === "public" && !CLOUDFRONT_URL) {
+      return res.json({ url: s3PublicUrl, expiresInSeconds });
     }
 
     const signedS3Url = await getS3SignedUrl(file.s3_key, expiresInSeconds);
